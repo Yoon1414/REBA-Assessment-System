@@ -1,14 +1,11 @@
 # ==========================================================
 # app.py — Streamlit Main Application
-# Imports: reba.py, angle.py, visualization.py, export.py
-# Supports: Single image, Video, Folder of images
-# Panels: panel1_skeleton, panel2_depth, panel3_coordinates, panel4_reba
+# Clean dashboard: Skeleton + Depth Heatmap + REBA Score
 # ==========================================================
 
 import io
 import os
 import cv2
-import glob
 import datetime
 import tempfile
 import numpy as np
@@ -18,100 +15,14 @@ import streamlit as st
 from ultralytics import YOLO
 import torch
 
-# ── Import project modules ────────────────────────────────
 from reba          import compute_reba, risk_color_bgr
 from angle         import (compute_angles_2d, compute_angles_3d,
                             KP_CONF_THRESHOLD, COCO17_NAMES)
 from visualization import draw_person
 from export        import build_excel, build_pdf
-from panels.panel1_skeleton    import render_panel1
-from panels.panel2_depth       import render_panel2
-from panels.panel3_coordinates import render_panel3
-from panels.panel4_reba        import render_panel4
 
 # ============================================================
-# HELPER — Render all 4 panels for one person
-# MUST be defined before it is called below
-# ============================================================
-
-def _render_all_panels(frame, depth_vis, depth, kps, kpc,
-                        tid, conf, result, use_midas, w, h):
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "🦴 Skeleton",
-        "🌈 Depth Map",
-        "📍 Coordinates",
-        "📊 REBA Workflow",
-    ])
-
-    with tab1:
-        render_panel1(
-            annotated_img = frame,
-            person_id     = tid,
-            confidence    = conf,
-            reba_score    = result["REBA_final"],
-            risk_level    = result["risk"],
-        )
-
-    with tab2:
-        if use_midas and depth_vis is not None and depth is not None:
-            z_values = []
-            for (px, py) in kps:
-                ui = int(np.clip(px, 0, w - 1))
-                vi = int(np.clip(py, 0, h - 1))
-                z_values.append(float(depth[vi, ui]))
-            render_panel2(depth_image=depth_vis, z_values=z_values)
-        else:
-            st.info("🔵 MiDaS 3D Depth is **disabled**. Enable it in System Settings.")
-
-    with tab3:
-        if use_midas and depth is not None:
-            coord_rows = []
-            for ji, (px, py) in enumerate(kps):
-                ui = int(np.clip(px, 0, w - 1))
-                vi = int(np.clip(py, 0, h - 1))
-                Z  = float(depth[vi, ui])
-                coord_rows.append({
-                    "Joint":       COCO17_NAMES[ji],
-                    "u (pixel x)": round(float(px), 1),
-                    "v (pixel y)": round(float(py), 1),
-                    "z (depth)":   round(Z, 4),
-                    "Confidence":  round(float(kpc[ji]), 3),
-                })
-        else:
-            coord_rows = []
-            for ji, (px, py) in enumerate(kps):
-                coord_rows.append({
-                    "Joint":       COCO17_NAMES[ji],
-                    "u (pixel x)": round(float(px), 1),
-                    "v (pixel y)": round(float(py), 1),
-                    "Confidence":  round(float(kpc[ji]), 3),
-                })
-        coord_df = pd.DataFrame(coord_rows)
-        render_panel3(coord_df=coord_df)
-
-    with tab4:
-        render_panel4(
-            neck       = result["neck_bin"],
-            trunk      = result["trunk_bin"],
-            leg        = result["leg_bin"],
-            upper_arm  = result["upper_bin"],
-            lower_arm  = result["lower_bin"],
-            wrist      = result["wrist_bin"],
-            table_a    = result["A_posture"],
-            load_force = result["force_score"],
-            score_a    = result["Score_A"],
-            table_b    = result["B_posture"],
-            coupling   = result["coupling"],
-            score_b    = result["Score_B"],
-            table_c    = result["C_score"],
-            activity   = result["activity"],
-            reba_score = result["REBA_final"],
-            risk_level = result["risk"],
-        )
-
-
-# ============================================================
-# STREAMLIT PAGE CONFIG
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(layout="wide", page_title="REBA Assessment System")
@@ -127,7 +38,7 @@ st.sidebar.header("⚙️ System Settings")
 
 use_midas = st.sidebar.toggle(
     "🔵 Use MiDaS 3D Depth", value=False,
-    help="OFF = 2D pixel angles (stable, recommended)\nON = 3D with MiDaS depth")
+    help="OFF = 2D pixel angles\nON = 3D with MiDaS depth")
 
 if use_midas:
     depth_variant = st.sidebar.selectbox(
@@ -137,13 +48,11 @@ if use_midas:
     )
 
 pose_weights = st.sidebar.text_input(
-    "YOLO model path",
-    value="best.pt")
+    "YOLO model path", value="best.pt")
 
 kp_conf_thresh = st.sidebar.slider(
     "Keypoint confidence threshold",
-    min_value=0.1, max_value=0.9, value=0.3, step=0.05,
-    help="Higher = stricter. Low-confidence joints use neutral defaults.")
+    min_value=0.1, max_value=0.9, value=0.3, step=0.05)
 
 st.sidebar.divider()
 
@@ -196,7 +105,6 @@ st.sidebar.header("📁 Input")
 input_mode = st.sidebar.radio(
     "Input mode",
     ["📂 Folder Path (batch)", "🖼️ Single Image", "🎥 Video"],
-    help="Folder = process all images in folder at once"
 )
 
 frames      = []
@@ -208,7 +116,6 @@ if input_mode == "📂 Folder Path (batch)":
         "Folder path", value="",
         help="All JPG/PNG images in this folder will be processed"
     )
-
     if folder_path and os.path.isdir(folder_path):
         all_files = os.listdir(folder_path)
         img_paths = []
@@ -216,7 +123,6 @@ if input_mode == "📂 Folder Path (batch)":
             if f.lower().endswith(('.jpg', '.jpeg', '.png')):
                 img_paths.append(os.path.join(folder_path, f))
         img_paths = sorted(img_paths)
-
         if img_paths:
             st.sidebar.success(f"✅ Found **{len(img_paths)} images**")
             st.sidebar.caption(f"First: {os.path.basename(img_paths[0])}")
@@ -225,11 +131,10 @@ if input_mode == "📂 Folder Path (batch)":
             st.sidebar.warning("⚠️ No images found in this folder")
             img_paths = []
     elif folder_path:
-        st.sidebar.error("❌ Folder not found. Check the path.")
+        st.sidebar.error("❌ Folder not found.")
         img_paths = []
     else:
         img_paths = []
-
     file = None
 
 elif input_mode == "🖼️ Single Image":
@@ -256,6 +161,24 @@ run_btn = st.sidebar.button("▶️ Run REBA Analysis",
                              type="primary")
 
 # ============================================================
+# RISK COLOR (hex for st.markdown)
+# ============================================================
+
+def risk_hex(score):
+    if   score == 1:        return "#27AE60"   # green
+    elif score <= 3:        return "#F1C40F"   # yellow
+    elif score <= 7:        return "#E67E22"   # orange
+    elif score <= 10:       return "#E74C3C"   # red
+    else:                   return "#7B241C"   # dark red
+
+def action_text(score):
+    if   score == 1:        return "No action required"
+    elif score <= 3:        return "May need action"
+    elif score <= 7:        return "Further investigate. Change soon."
+    elif score <= 10:       return "Investigate and implement change"
+    else:                   return "Implement change immediately"
+
+# ============================================================
 # MAIN — Processing
 # ============================================================
 
@@ -266,21 +189,17 @@ if run_btn and ready:
             f"Mode: **{'3D MiDaS' if use_midas else '2D Pixel'}** | "
             f"Input: **{input_mode}**")
 
-    # Load YOLO
     with st.spinner("Loading YOLO model..."):
         model = YOLO(pose_weights)
 
-    # Load MiDaS (if enabled)
     midas = None; transform = None
     if use_midas:
         with st.spinner("Loading MiDaS depth model..."):
             midas     = torch.hub.load("intel-isl/MiDaS", depth_variant)
             midas.to(device).eval()
-            transform = torch.hub.load("intel-isl/MiDaS", "transforms")
-            if depth_variant == "MiDaS_small":
-                transform = transform.small_transform
-            else:
-                transform = transform.dpt_transform
+            tfms = torch.hub.load("intel-isl/MiDaS", "transforms")
+            transform = tfms.small_transform if depth_variant == "MiDaS_small" \
+                        else tfms.dpt_transform
 
     # ── Load frames ───────────────────────────────────────
     frames      = []
@@ -314,19 +233,13 @@ if run_btn and ready:
             fcount += 1
         cap.release()
 
-    # ── Processing loop (fast — no panels here) ───────────
+    # ── Processing loop ───────────────────────────────────
     scores_all       = []
     coords_all       = []
     annotated_frames = []
-    panel_data       = []   # store panel data, render AFTER loop
 
     prog  = st.progress(0, text="Starting...")
     total = len(frames)
-
-    if input_mode == "📂 Folder Path (batch)":
-        st.subheader(f"📸 Processing {total} images")
-        img_cols = st.columns(3)
-        col_idx  = 0
 
     for fid, frame in enumerate(frames):
         fname = frame_names[fid]
@@ -440,43 +353,65 @@ if run_btn and ready:
 
             coords_all.append(coord_entry)
 
-            # ── Store panel data for later rendering ───────
-            panel_data.append({
-                "fid":       fid,
-                "fname":     fname,
-                "tid":       tid,
-                "conf":      conf,
-                "result":    result,
-                "frame":     frame.copy(),
-                "depth_vis": depth_vis,
-                "depth":     depth,
-                "kps":       kps,
-                "kpc":       kpc,
-                "w":         w,
-                "h":         h,
-            })
+            # ══════════════════════════════════════════════
+            # INLINE RESULT CARD — Skeleton + Heatmap + Score
+            # ══════════════════════════════════════════════
+            reba_score = result["REBA_final"]
+            risk       = result["risk"]
+            color      = risk_hex(reba_score)
+            action     = action_text(reba_score)
+
+            st.markdown(f"---")
+            st.markdown(
+                f"<h4>🧍 Worker ID {tid} &nbsp;|&nbsp; "
+                f"Frame {fid+1} — {fname}</h4>",
+                unsafe_allow_html=True
+            )
+
+            # ── Image columns ──────────────────────────────
+            if use_midas and depth_vis is not None:
+                col_img1, col_img2 = st.columns(2)
+                with col_img1:
+                    st.markdown("**🦴 Skeleton Overlay**")
+                    st.image(frame, channels="BGR",
+                             use_container_width=True)
+                with col_img2:
+                    st.markdown("**🌈 Depth Heatmap**")
+                    st.image(depth_vis, channels="BGR",
+                             use_container_width=True)
+            else:
+                col_l, col_img, col_r = st.columns([1, 3, 1])
+                with col_img:
+                    st.markdown("**🦴 Skeleton Overlay**")
+                    st.image(frame, channels="BGR",
+                             use_container_width=True)
+
+            # ── REBA Score card ────────────────────────────
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("REBA Score",       reba_score)
+            m2.metric("Risk Level",       risk)
+            m3.metric("Detection Conf",   f"{conf:.2f}")
+            m4.metric("Trunk Fwd°",       f"{result['trunk_fwd']}°")
+
+            st.markdown(
+                f"""
+                <div style="
+                    background:{color};
+                    padding:10px 16px;
+                    border-radius:8px;
+                    color:white;
+                    font-weight:bold;
+                    font-size:15px;
+                    margin-top:6px;
+                ">
+                ⚠️ Recommended Action: {action}
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+            st.markdown("")
 
         annotated_frames.append((fid, frame.copy()))
-
-        # ── Display annotated frame thumbnail ──────────────
-        if input_mode == "📂 Folder Path (batch)":
-            disp_w = 600
-            disp_h = int(frame.shape[0] * disp_w / frame.shape[1])
-            display = cv2.resize(frame, (disp_w, disp_h))
-            with img_cols[col_idx % 3]:
-                st.image(display, channels="BGR",
-                         caption=fname, use_container_width=True)
-            col_idx += 1
-
-        elif input_mode in ["🖼️ Single Image", "🎥 Video"]:
-            disp_w = 800
-            disp_h = int(frame.shape[0] * disp_w / frame.shape[1])
-            display = cv2.resize(frame, (disp_w, disp_h))
-            col_l, col_c, col_r = st.columns([1, 4, 1])
-            with col_c:
-                st.image(display, channels="BGR",
-                         caption=f"{fname} — Frame {fid+1}",
-                         use_container_width=True)
 
     prog.empty()
 
@@ -487,7 +422,7 @@ if run_btn and ready:
     if not scores_all:
         st.warning("⚠️ No people detected. Check YOLO path and input.")
     else:
-        cols = [
+        cols_names = [
             "Frame_ID", "Filename", "TrackID", "Person_conf",
             "Trunk_fwd°", "Neck_fwd°", "Knee_bend°",
             "UpperArm°", "Elbow°", "Wrist_dev°",
@@ -502,17 +437,17 @@ if run_btn and ready:
             "B_posture", "Coupling", "Score_B",
             "Table_C", "Activity", "REBA_Final", "Risk"
         ]
-        df = pd.DataFrame(scores_all, columns=cols)
+        df = pd.DataFrame(scores_all, columns=cols_names)
 
         st.divider()
         st.subheader("📊 REBA Results Dashboard")
 
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Images/Frames", total)
-        c2.metric("People Detected", df["TrackID"].nunique())
+        c1.metric("Images/Frames",    total)
+        c2.metric("People Detected",  df["TrackID"].nunique())
         c3.metric("Total Detections", len(df))
-        c4.metric("Avg REBA", round(df["REBA_Final"].mean(), 1))
-        c5.metric("Max REBA", df["REBA_Final"].max())
+        c4.metric("Avg REBA",         round(df["REBA_Final"].mean(), 1))
+        c5.metric("Max REBA",         df["REBA_Final"].max())
 
         st.subheader("Risk Level Summary")
         rc = df["Risk"].value_counts().reset_index()
@@ -536,7 +471,7 @@ if run_btn and ready:
         with st.spinner("Building Excel..."):
             excel_buf = build_excel(df, coords_all)
 
-        with st.spinner("Building PDF report (all images)..."):
+        with st.spinner("Building PDF report..."):
             pdf_buf = build_pdf(df, annotated_frames)
 
         csv_buf = io.BytesIO()
@@ -559,15 +494,6 @@ if run_btn and ready:
             mime="application/zip",
             type="primary",
             use_container_width=True,
-        )
-        st.caption(
-            f"ZIP contains:\n"
-            f"📊 REBA_results_{timestamp}.xlsx  "
-            f"(Sheet 1: REBA Scores | Sheet 2: YOLO 2D coords | Sheet 3: MiDaS 3D coords)\n"
-            f"📄 REBA_report_{timestamp}.pdf  "
-            f"(All {len(annotated_frames)} annotated images + score tables)\n"
-            f"📋 REBA_scores_{timestamp}.csv  "
-            f"(Raw scores for further analysis)"
         )
 
         st.markdown("**Or download individually:**")
@@ -602,32 +528,3 @@ if run_btn and ready:
                 mime="text/csv"
             )
             st.caption("Raw scores only")
-
-        # ============================================================
-        # PANELS — rendered AFTER all processing is done
-        # ============================================================
-
-        st.divider()
-        st.subheader("🔍 Detailed Analysis Per Worker")
-        st.caption("Expand each worker to view skeleton, depth map, coordinates and REBA workflow.")
-
-        for pd_item in panel_data:
-            with st.expander(
-                f"📋 Frame {pd_item['fid']+1} | {pd_item['fname']} | "
-                f"Worker ID {pd_item['tid']} | "
-                f"REBA {pd_item['result']['REBA_final']} — {pd_item['result']['risk']}",
-                expanded=False
-            ):
-                _render_all_panels(
-                    pd_item["frame"],
-                    pd_item["depth_vis"],
-                    pd_item["depth"],
-                    pd_item["kps"],
-                    pd_item["kpc"],
-                    pd_item["tid"],
-                    pd_item["conf"],
-                    pd_item["result"],
-                    use_midas,
-                    pd_item["w"],
-                    pd_item["h"],
-                )
