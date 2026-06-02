@@ -1,6 +1,7 @@
 # ==========================================================
 # app.py — Streamlit Main Application
 # Clean dashboard: Skeleton + Depth Heatmap + REBA Score
+# Workers shown side by side, smaller images
 # ==========================================================
 
 import io
@@ -46,6 +47,8 @@ if use_midas:
         ["MiDaS_small", "DPT_Hybrid"],
         help="MiDaS_small = faster | DPT_Hybrid = more accurate"
     )
+else:
+    depth_variant = "MiDaS_small"
 
 pose_weights = st.sidebar.text_input(
     "YOLO model path", value="best.pt")
@@ -161,22 +164,28 @@ run_btn = st.sidebar.button("▶️ Run REBA Analysis",
                              type="primary")
 
 # ============================================================
-# RISK COLOR (hex for st.markdown)
+# HELPERS
 # ============================================================
 
 def risk_hex(score):
-    if   score == 1:        return "#27AE60"   # green
-    elif score <= 3:        return "#F1C40F"   # yellow
-    elif score <= 7:        return "#E67E22"   # orange
-    elif score <= 10:       return "#E74C3C"   # red
-    else:                   return "#7B241C"   # dark red
+    if   score == 1:  return "#27AE60"
+    elif score <= 3:  return "#F1C40F"
+    elif score <= 7:  return "#E67E22"
+    elif score <= 10: return "#E74C3C"
+    else:             return "#7B241C"
 
 def action_text(score):
-    if   score == 1:        return "No action required"
-    elif score <= 3:        return "May need action"
-    elif score <= 7:        return "Further investigate. Change soon."
-    elif score <= 10:       return "Investigate and implement change"
-    else:                   return "Implement change immediately"
+    if   score == 1:  return "No action required"
+    elif score <= 3:  return "May need action"
+    elif score <= 7:  return "Further investigate. Change soon."
+    elif score <= 10: return "Investigate and implement change"
+    else:             return "Implement change immediately"
+
+def resize_img(img_bgr, max_w=400):
+    """Resize BGR image to max_w pixels wide, keep aspect ratio."""
+    h, w = img_bgr.shape[:2]
+    scale = max_w / w
+    return cv2.resize(img_bgr, (max_w, int(h * scale)))
 
 # ============================================================
 # MAIN — Processing
@@ -189,17 +198,28 @@ if run_btn and ready:
             f"Mode: **{'3D MiDaS' if use_midas else '2D Pixel'}** | "
             f"Input: **{input_mode}**")
 
+    # ── Load YOLO ─────────────────────────────────────────
     with st.spinner("Loading YOLO model..."):
         model = YOLO(pose_weights)
+    st.success("✅ YOLO model loaded!")
 
+    # ── Load MiDaS (only if enabled) ──────────────────────
     midas = None; transform = None
     if use_midas:
-        with st.spinner("Loading MiDaS depth model..."):
-            midas     = torch.hub.load("intel-isl/MiDaS", depth_variant)
+        midas_status = st.empty()
+        midas_status.info(f"⏳ Loading MiDaS **{depth_variant}** model... (may take 1–3 min on CPU)")
+        try:
+            midas = torch.hub.load("intel-isl/MiDaS", depth_variant,
+                                   trust_repo=True)
             midas.to(device).eval()
-            tfms = torch.hub.load("intel-isl/MiDaS", "transforms")
+            tfms      = torch.hub.load("intel-isl/MiDaS", "transforms",
+                                       trust_repo=True)
             transform = tfms.small_transform if depth_variant == "MiDaS_small" \
                         else tfms.dpt_transform
+            midas_status.success(f"✅ MiDaS **{depth_variant}** loaded!")
+        except Exception as e:
+            midas_status.error(f"❌ MiDaS failed to load: {e}")
+            midas = None
 
     # ── Load frames ───────────────────────────────────────
     frames      = []
@@ -270,20 +290,28 @@ if run_btn and ready:
         else:
             ids = np.arange(1, len(kps_all) + 1)
 
+        # MiDaS depth
         depth     = None
         depth_vis = None
         if use_midas and midas is not None:
-            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            inp     = transform(img_rgb).to(device)
-            with torch.no_grad():
-                d     = midas(inp)
-                depth = torch.nn.functional.interpolate(
-                    d.unsqueeze(1), size=(h, w),
-                    mode="bicubic", align_corners=False
-                ).squeeze().cpu().numpy()
-            depth_norm = cv2.normalize(depth, None, 0, 255,
-                                       cv2.NORM_MINMAX).astype(np.uint8)
-            depth_vis  = cv2.applyColorMap(depth_norm, cv2.COLORMAP_INFERNO)
+            try:
+                img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                inp     = transform(img_rgb).to(device)
+                with torch.no_grad():
+                    d     = midas(inp)
+                    depth = torch.nn.functional.interpolate(
+                        d.unsqueeze(1), size=(h, w),
+                        mode="bicubic", align_corners=False
+                    ).squeeze().cpu().numpy()
+                depth_norm = cv2.normalize(depth, None, 0, 255,
+                                           cv2.NORM_MINMAX).astype(np.uint8)
+                depth_vis  = cv2.applyColorMap(depth_norm, cv2.COLORMAP_INFERNO)
+            except Exception as e:
+                st.warning(f"MiDaS inference failed for frame {fid+1}: {e}")
+                depth = None; depth_vis = None
+
+        # ── Process each person, collect results ───────────
+        frame_persons = []   # list of per-person data for this frame
 
         for pidx, kps in enumerate(kps_all):
             tid  = int(ids[pidx])
@@ -353,65 +381,97 @@ if run_btn and ready:
 
             coords_all.append(coord_entry)
 
-            # ══════════════════════════════════════════════
-            # INLINE RESULT CARD — Skeleton + Heatmap + Score
-            # ══════════════════════════════════════════════
-            reba_score = result["REBA_final"]
-            risk       = result["risk"]
-            color      = risk_hex(reba_score)
-            action     = action_text(reba_score)
-
-            st.markdown(f"---")
-            st.markdown(
-                f"<h4>🧍 Worker ID {tid} &nbsp;|&nbsp; "
-                f"Frame {fid+1} — {fname}</h4>",
-                unsafe_allow_html=True
-            )
-
-            # ── Image columns ──────────────────────────────
-            if use_midas and depth_vis is not None:
-                col_img1, col_img2 = st.columns(2)
-                with col_img1:
-                    st.markdown("**🦴 Skeleton Overlay**")
-                    st.image(frame, channels="BGR",
-                             use_container_width=True)
-                with col_img2:
-                    st.markdown("**🌈 Depth Heatmap**")
-                    st.image(depth_vis, channels="BGR",
-                             use_container_width=True)
-            else:
-                col_l, col_img, col_r = st.columns([1, 3, 1])
-                with col_img:
-                    st.markdown("**🦴 Skeleton Overlay**")
-                    st.image(frame, channels="BGR",
-                             use_container_width=True)
-
-            # ── REBA Score card ────────────────────────────
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("REBA Score",       reba_score)
-            m2.metric("Risk Level",       risk)
-            m3.metric("Detection Conf",   f"{conf:.2f}")
-            m4.metric("Trunk Fwd°",       f"{result['trunk_fwd']}°")
-
-            st.markdown(
-                f"""
-                <div style="
-                    background:{color};
-                    padding:10px 16px;
-                    border-radius:8px;
-                    color:white;
-                    font-weight:bold;
-                    font-size:15px;
-                    margin-top:6px;
-                ">
-                ⚠️ Recommended Action: {action}
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-            st.markdown("")
+            frame_persons.append({
+                "tid":        tid,
+                "conf":       conf,
+                "result":     result,
+                "depth_vis":  depth_vis,
+            })
 
         annotated_frames.append((fid, frame.copy()))
+
+        # ══════════════════════════════════════════════════
+        # DISPLAY — Frame header + workers SIDE BY SIDE
+        # ══════════════════════════════════════════════════
+
+        if frame_persons:
+            st.markdown("---")
+            st.markdown(f"**📸 Frame {fid+1} — {fname}**")
+
+            n_workers = len(frame_persons)
+
+            # Resize annotated frame for display
+            disp_frame = resize_img(frame, max_w=400)
+
+            if n_workers == 1:
+                # ── Single worker ──────────────────────────
+                p     = frame_persons[0]
+                reba  = p["result"]["REBA_final"]
+                risk  = p["result"]["risk"]
+                color = risk_hex(reba)
+
+                if use_midas and p["depth_vis"] is not None:
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.markdown(f"**🦴 Worker ID {p['tid']} — Skeleton**")
+                        st.image(disp_frame, channels="BGR", width=400)
+                    with c2:
+                        st.markdown(f"**🌈 Worker ID {p['tid']} — Depth Heatmap**")
+                        st.image(resize_img(p["depth_vis"], 400),
+                                 channels="BGR", width=400)
+                else:
+                    col_l, col_c, col_r = st.columns([1, 2, 1])
+                    with col_c:
+                        st.markdown(f"**🦴 Worker ID {p['tid']} — Skeleton**")
+                        st.image(disp_frame, channels="BGR", width=400)
+
+                # Score card
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Worker ID",   p["tid"])
+                m2.metric("REBA Score",  reba)
+                m3.metric("Risk Level",  risk)
+                m4.metric("Confidence",  f"{p['conf']:.2f}")
+                st.markdown(
+                    f'<div style="background:{color};padding:10px;'
+                    f'border-radius:8px;color:white;font-weight:bold;">'
+                    f'⚠️ {action_text(reba)}</div>',
+                    unsafe_allow_html=True)
+
+            else:
+                # ── Multiple workers side by side ──────────
+                # Show the full annotated frame once at top
+                col_l, col_c, col_r = st.columns([1, 3, 1])
+                with col_c:
+                    st.markdown("**🦴 All Workers — Skeleton Overlay**")
+                    st.image(disp_frame, channels="BGR", width=600)
+
+                # Show depth heatmap once (same for all workers)
+                if use_midas and frame_persons[0]["depth_vis"] is not None:
+                    col_l2, col_c2, col_r2 = st.columns([1, 3, 1])
+                    with col_c2:
+                        st.markdown("**🌈 Depth Heatmap**")
+                        st.image(resize_img(frame_persons[0]["depth_vis"], 600),
+                                 channels="BGR", width=600)
+
+                # Score cards side by side — one column per worker
+                st.markdown("**📊 REBA Scores per Worker**")
+                worker_cols = st.columns(n_workers)
+                for i, p in enumerate(frame_persons):
+                    reba  = p["result"]["REBA_final"]
+                    risk  = p["result"]["risk"]
+                    color = risk_hex(reba)
+                    with worker_cols[i]:
+                        st.metric(f"Worker ID {p['tid']}", f"REBA {reba}")
+                        st.metric("Risk Level", risk)
+                        st.metric("Confidence", f"{p['conf']:.2f}")
+                        st.markdown(
+                            f'<div style="background:{color};padding:8px;'
+                            f'border-radius:6px;color:white;font-weight:bold;'
+                            f'font-size:13px;text-align:center;">'
+                            f'{action_text(reba)}</div>',
+                            unsafe_allow_html=True)
+
+        st.markdown("")
 
     prog.empty()
 
@@ -470,7 +530,6 @@ if run_btn and ready:
 
         with st.spinner("Building Excel..."):
             excel_buf = build_excel(df, coords_all)
-
         with st.spinner("Building PDF report..."):
             pdf_buf = build_pdf(df, annotated_frames)
 
@@ -498,33 +557,24 @@ if run_btn and ready:
 
         st.markdown("**Or download individually:**")
         dl1, dl2, dl3 = st.columns(3)
-
         with dl1:
             excel_buf.seek(0)
             st.download_button(
-                label="📊 Excel only",
-                data=excel_buf,
+                label="📊 Excel only", data=excel_buf,
                 file_name=f"REBA_results_{timestamp}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             st.caption("Coordinates + REBA scores")
-
         with dl2:
             pdf_buf.seek(0)
             st.download_button(
-                label="📄 PDF only",
-                data=pdf_buf,
+                label="📄 PDF only", data=pdf_buf,
                 file_name=f"REBA_report_{timestamp}.pdf",
-                mime="application/pdf"
-            )
+                mime="application/pdf")
             st.caption(f"All {len(annotated_frames)} annotated images")
-
         with dl3:
             csv_buf.seek(0)
             st.download_button(
-                label="📋 CSV only",
-                data=csv_buf,
+                label="📋 CSV only", data=csv_buf,
                 file_name=f"REBA_scores_{timestamp}.csv",
-                mime="text/csv"
-            )
+                mime="text/csv")
             st.caption("Raw scores only")
