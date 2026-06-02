@@ -157,10 +157,11 @@ use_midas = st.sidebar.toggle(
     help="OFF = 2D pixel angles (stable, recommended)\nON = 3D with MiDaS depth")
 
 if use_midas:
-    st.sidebar.warning("3D MiDaS — less stable for back/side views")
-    depth_variant = st.sidebar.selectbox("MiDaS model", ["DPT_Hybrid"])
-else:
-    st.sidebar.success("2D Pixel mode — stable for all views ✅")
+    depth_variant = st.sidebar.selectbox(
+        "MiDaS model",
+        ["MiDaS_small", "DPT_Hybrid"],
+        help="MiDaS_small = faster | DPT_Hybrid = more accurate"
+    )
 
 pose_weights = st.sidebar.text_input(
     "YOLO model path",
