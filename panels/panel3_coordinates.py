@@ -3,6 +3,7 @@
 import streamlit as st
 import pandas as pd
 from io import BytesIO
+import uuid
 
 
 def render_panel3(coord_df):
@@ -17,7 +18,7 @@ def render_panel3(coord_df):
         Joint
         u
         v
-        z
+        z (optional, only in 3D mode)
     """
 
     # ===================================
@@ -75,21 +76,25 @@ def render_panel3(coord_df):
     )
 
     # ===================================
-    # Export Buttons
+    # Export Buttons — unique key per render
     # ===================================
+
+    # Generate a unique suffix so buttons don't clash
+    # when multiple people are detected in one run
+    unique_key = str(uuid.uuid4())[:8]
 
     col1, col2 = st.columns(2)
 
     csv_data = coord_df.to_csv(index=False)
 
     with col1:
-
         st.download_button(
             label="📄 Export CSV",
             data=csv_data,
             file_name="joint_coordinates.csv",
             mime="text/csv",
-            use_container_width=True
+            use_container_width=True,
+            key=f"csv_download_{unique_key}"
         )
 
     excel_buffer = BytesIO()
@@ -108,11 +113,11 @@ def render_panel3(coord_df):
     excel_buffer.seek(0)
 
     with col2:
-
         st.download_button(
             label="📊 Export Excel",
             data=excel_buffer,
             file_name="joint_coordinates.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
+            use_container_width=True,
+            key=f"excel_download_{unique_key}"
         )
