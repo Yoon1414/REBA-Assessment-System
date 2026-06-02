@@ -198,28 +198,45 @@ if run_btn and ready:
             f"Mode: **{'3D MiDaS' if use_midas else '2D Pixel'}** | "
             f"Input: **{input_mode}**")
 
-    # ── Load YOLO ─────────────────────────────────────────
+    # ── Load YOLO (cached — loads only once per session) ──
+    @st.cache_resource
+    def load_yolo(weights):
+        return YOLO(weights)
+
     with st.spinner("Loading YOLO model..."):
-        model = YOLO(pose_weights)
+        model = load_yolo(pose_weights)
     st.success("✅ YOLO model loaded!")
 
-    # ── Load MiDaS (only if enabled) ──────────────────────
+    # ── Load MiDaS (cached — loads only once per session) ─
+    @st.cache_resource
+    def load_midas_model(variant, dev):
+        m = torch.hub.load(
+            "intel-isl/MiDaS", variant,
+            pretrained=True, trust_repo=True, force_reload=False)
+        m.to(dev).eval()
+        tfms = torch.hub.load(
+            "intel-isl/MiDaS", "transforms",
+            trust_repo=True, force_reload=False)
+        t = tfms.small_transform if variant == "MiDaS_small" \
+            else tfms.dpt_transform
+        return m, t
+
     midas = None; transform = None
     if use_midas:
         midas_status = st.empty()
-        midas_status.info(f"⏳ Loading MiDaS **{depth_variant}** model... (may take 1–3 min on CPU)")
+        midas_status.warning(
+            f"⏳ Loading MiDaS **{depth_variant}**... "
+            f"First load downloads ~400MB. Next run will be instant (cached)."
+        )
         try:
-            midas = torch.hub.load("intel-isl/MiDaS", depth_variant,
-                                   trust_repo=True)
-            midas.to(device).eval()
-            tfms      = torch.hub.load("intel-isl/MiDaS", "transforms",
-                                       trust_repo=True)
-            transform = tfms.small_transform if depth_variant == "MiDaS_small" \
-                        else tfms.dpt_transform
-            midas_status.success(f"✅ MiDaS **{depth_variant}** loaded!")
+            midas, transform = load_midas_model(depth_variant, device)
+            midas_status.success(
+                f"✅ MiDaS **{depth_variant}** loaded! (cached — next run instant)"
+            )
         except Exception as e:
-            midas_status.error(f"❌ MiDaS failed to load: {e}")
+            midas_status.error(f"❌ MiDaS failed: {e} — using 2D mode.")
             midas = None
+            use_midas = False
 
     # ── Load frames ───────────────────────────────────────
     frames      = []
