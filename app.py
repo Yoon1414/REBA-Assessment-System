@@ -30,6 +30,114 @@ from panels.panel3_coordinates import render_panel3
 from panels.panel4_reba        import render_panel4
 
 # ============================================================
+# HELPER — Render all 4 panels for one person
+# MUST be defined before it is called below
+# ============================================================
+
+def _render_all_panels(frame, depth_vis, depth, kps, kpc,
+                        tid, conf, result, use_midas, w, h):
+    """
+    Render Panel 1-4 for a single detected person.
+
+    Parameters
+    ----------
+    frame      : annotated BGR image (already drawn on)
+    depth_vis  : colored depth map BGR image (or None if 2D mode)
+    depth      : raw depth numpy array (or None)
+    kps        : (17,2) keypoint pixel coordinates
+    kpc        : (17,) keypoint confidences
+    tid        : track / worker ID
+    conf       : YOLO detection confidence
+    result     : dict from compute_reba()
+    use_midas  : bool
+    w, h       : frame width / height
+    """
+
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🦴 Skeleton",
+        "🌈 Depth Map",
+        "📍 Coordinates",
+        "📊 REBA Workflow",
+    ])
+
+    # ── Panel 1: Skeleton Detection ───────────────────────
+    with tab1:
+        render_panel1(
+            annotated_img = frame,
+            person_id     = tid,
+            confidence    = conf,
+            reba_score    = result["REBA_final"],
+            risk_level    = result["risk"],
+        )
+
+    # ── Panel 2: Depth Map ────────────────────────────────
+    with tab2:
+        if use_midas and depth_vis is not None and depth is not None:
+            z_values = []
+            for (px, py) in kps:
+                ui = int(np.clip(px, 0, w - 1))
+                vi = int(np.clip(py, 0, h - 1))
+                z_values.append(float(depth[vi, ui]))
+            render_panel2(
+                depth_image = depth_vis,
+                z_values    = z_values,
+            )
+        else:
+            st.info(
+                "🔵 MiDaS 3D Depth is **disabled**. "
+                "Enable it in System Settings to see the depth map."
+            )
+
+    # ── Panel 3: Joint Coordinates ────────────────────────
+    with tab3:
+        if use_midas and depth is not None:
+            coord_rows = []
+            for ji, (px, py) in enumerate(kps):
+                ui = int(np.clip(px, 0, w - 1))
+                vi = int(np.clip(py, 0, h - 1))
+                Z  = float(depth[vi, ui])
+                coord_rows.append({
+                    "Joint":       COCO17_NAMES[ji],
+                    "u (pixel x)": round(float(px), 1),
+                    "v (pixel y)": round(float(py), 1),
+                    "z (depth)":   round(Z, 4),
+                    "Confidence":  round(float(kpc[ji]), 3),
+                })
+        else:
+            coord_rows = []
+            for ji, (px, py) in enumerate(kps):
+                coord_rows.append({
+                    "Joint":       COCO17_NAMES[ji],
+                    "u (pixel x)": round(float(px), 1),
+                    "v (pixel y)": round(float(py), 1),
+                    "Confidence":  round(float(kpc[ji]), 3),
+                })
+        coord_df = pd.DataFrame(coord_rows)
+        render_panel3(coord_df=coord_df)
+
+    # ── Panel 4: REBA Assessment Workflow ─────────────────
+    with tab4:
+        render_panel4(
+            neck       = result["neck_bin"],
+            trunk      = result["trunk_bin"],
+            leg        = result["leg_bin"],
+            upper_arm  = result["upper_bin"],
+            lower_arm  = result["lower_bin"],
+            wrist      = result["wrist_bin"],
+            table_a    = result["A_posture"],
+            load_force = result["force_score"],
+            score_a    = result["Score_A"],
+            table_b    = result["B_posture"],
+            coupling   = result["coupling"],
+            score_b    = result["Score_B"],
+            table_c    = result["C_score"],
+            activity   = result["activity"],
+            reba_score = result["REBA_final"],
+            risk_level = result["risk"],
+        )
+
+
+# ============================================================
 # STREAMLIT PAGE CONFIG
 # ============================================================
 
@@ -245,7 +353,6 @@ if run_btn and ready:
     prog  = st.progress(0, text="Starting...")
     total = len(frames)
 
-    # For batch: show a 3-column grid header
     if input_mode == "📂 Folder Path (batch)":
         st.subheader(f"📸 Processing {total} images")
         img_cols = st.columns(3)
@@ -282,8 +389,8 @@ if run_btn and ready:
             ids = np.arange(1, len(kps_all) + 1)
 
         # MiDaS depth map
-        depth      = None
-        depth_vis  = None   # colored depth image for Panel 2
+        depth     = None
+        depth_vis = None
         if use_midas and midas is not None:
             img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             inp     = transform(img_rgb).to(device)
@@ -293,7 +400,6 @@ if run_btn and ready:
                     d.unsqueeze(1), size=(h, w),
                     mode="bicubic", align_corners=False
                 ).squeeze().cpu().numpy()
-            # Build a color visualization of the depth map for Panel 2
             depth_norm = cv2.normalize(depth, None, 0, 255,
                                        cv2.NORM_MINMAX).astype(np.uint8)
             depth_vis  = cv2.applyColorMap(depth_norm, cv2.COLORMAP_INFERNO)
@@ -372,14 +478,8 @@ if run_btn and ready:
 
             coords_all.append(coord_entry)
 
-            # ══════════════════════════════════════════════
-            # PANELS — render for each detected person
-            # In batch mode: render inside an expander per frame.
-            # In single/video mode: render inline with tabs.
-            # ══════════════════════════════════════════════
-
+            # ── Render all 4 panels ────────────────────────
             if input_mode == "📂 Folder Path (batch)":
-                # Batch: one expander per person per frame
                 with st.expander(
                     f"📋 Frame {fid+1} | {fname} | Worker ID {tid} "
                     f"| REBA {result['REBA_final']} — {result['risk']}",
@@ -389,9 +489,7 @@ if run_btn and ready:
                         frame, depth_vis, depth, kps, kpc,
                         tid, conf, result, use_midas, w, h
                     )
-
             else:
-                # Single image / video: render inline with tabs
                 st.markdown(
                     f"#### 🧍 Worker ID {tid} | Frame {fid+1} — {fname}"
                 )
@@ -402,7 +500,7 @@ if run_btn and ready:
 
         annotated_frames.append((fid, frame.copy()))
 
-        # ── Batch grid preview (thumbnail only) ───────────
+        # ── Display frame thumbnail ────────────────────────
         if input_mode == "📂 Folder Path (batch)":
             disp_w = 600
             disp_h = int(frame.shape[0] * disp_w / frame.shape[1])
@@ -546,119 +644,3 @@ if run_btn and ready:
                 mime="text/csv"
             )
             st.caption("Raw scores only")
-
-
-# ============================================================
-# HELPER — Render all 4 panels for one person
-# Called inside both batch (expander) and single/video (inline)
-# ============================================================
-
-def _render_all_panels(frame, depth_vis, depth, kps, kpc,
-                        tid, conf, result, use_midas, w, h):
-    """
-    Render Panel 1–4 for a single detected person.
-
-    Parameters
-    ----------
-    frame      : annotated BGR image (already drawn on)
-    depth_vis  : colored depth map BGR image (or None if 2D mode)
-    depth      : raw depth numpy array (or None)
-    kps        : (17,2) keypoint pixel coordinates
-    kpc        : (17,) keypoint confidences
-    tid        : track / worker ID
-    conf       : YOLO detection confidence
-    result     : dict from compute_reba()
-    use_midas  : bool
-    w, h       : frame width / height
-    """
-
-    # ── 4 tabs for the 4 panels ───────────────────────────
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "🦴 Skeleton",
-        "🌈 Depth Map",
-        "📍 Coordinates",
-        "📊 REBA Workflow",
-    ])
-
-    # ── Panel 1: Skeleton Detection ───────────────────────
-    with tab1:
-        render_panel1(
-            annotated_img = frame,
-            person_id     = tid,
-            confidence    = conf,
-            reba_score    = result["REBA_final"],
-            risk_level    = result["risk"],
-        )
-
-    # ── Panel 2: Depth Map ────────────────────────────────
-    with tab2:
-        if use_midas and depth_vis is not None and depth is not None:
-            # Extract Z values at each detected keypoint
-            z_values = []
-            for (px, py) in kps:
-                ui = int(np.clip(px, 0, w - 1))
-                vi = int(np.clip(py, 0, h - 1))
-                z_values.append(float(depth[vi, ui]))
-
-            render_panel2(
-                depth_image = depth_vis,
-                z_values    = z_values,
-            )
-        else:
-            st.info(
-                "🔵 MiDaS 3D Depth is **disabled**. "
-                "Enable it in System Settings to see the depth map."
-            )
-
-    # ── Panel 3: Joint Coordinates ────────────────────────
-    with tab3:
-        from angle import COCO17_NAMES
-
-        if use_midas and depth is not None:
-            # Build pseudo-3D table (u, v, z)
-            coord_rows = []
-            for ji, (px, py) in enumerate(kps):
-                ui = int(np.clip(px, 0, w - 1))
-                vi = int(np.clip(py, 0, h - 1))
-                Z  = float(depth[vi, ui])
-                coord_rows.append({
-                    "Joint": COCO17_NAMES[ji],
-                    "u (pixel x)": round(float(px), 1),
-                    "v (pixel y)": round(float(py), 1),
-                    "z (depth)":   round(Z, 4),
-                    "Confidence":  round(float(kpc[ji]), 3),
-                })
-        else:
-            # 2D table (u, v only)
-            coord_rows = []
-            for ji, (px, py) in enumerate(kps):
-                coord_rows.append({
-                    "Joint": COCO17_NAMES[ji],
-                    "u (pixel x)": round(float(px), 1),
-                    "v (pixel y)": round(float(py), 1),
-                    "Confidence":  round(float(kpc[ji]), 3),
-                })
-
-        coord_df = pd.DataFrame(coord_rows)
-        render_panel3(coord_df=coord_df)
-
-    # ── Panel 4: REBA Assessment Workflow ─────────────────
-    with tab4:
-        render_panel4(
-            neck       = result["neck_bin"],
-            trunk      = result["trunk_bin"],
-            leg        = result["leg_bin"],
-            upper_arm  = result["upper_bin"],
-            lower_arm  = result["lower_bin"],
-            wrist      = result["wrist_bin"],
-            table_a    = result["A_posture"],
-            load_force = result["force_score"],
-            score_a    = result["Score_A"],
-            table_b    = result["B_posture"],
-            coupling   = result["coupling"],
-            score_b    = result["Score_B"],
-            table_c    = result["C_score"],
-            activity   = result["activity"],
-            reba_score = result["REBA_final"],
-            risk_level = result["risk"],
-        )
